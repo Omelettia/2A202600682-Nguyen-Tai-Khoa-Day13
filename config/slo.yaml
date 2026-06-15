@@ -4,7 +4,7 @@ slis:
   latency_p95_ms:
     objective: 3000
     target: 99.5
-    note: Replace with your group's target
+    note: 99.5% of requests under 3s; baseline measured p95 ~150ms in steady state.
   error_rate_pct:
     objective: 2
     target: 99.0

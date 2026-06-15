@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Day 13 — LLM Observability Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: #0b0f14; color: #e6edf3;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 14px 22px; border-bottom: 1px solid #1c2530; background: #0d141c;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .pill { font-size: 12px; padding: 3px 9px; border-radius: 999px; background: #16212e; border: 1px solid #243140; color: #9fb3c8; }
+  .pill.live { color: #34d399; border-color: #14532d; }
+  .spacer { flex: 1; }
+  .stats { display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; padding: 16px 22px 4px; }
+  .stat { background: #0f1722; border: 1px solid #1c2733; border-radius: 10px; padding: 12px 14px; }
+  .stat .label { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: #7d8da0; }
+  .stat .value { font-size: 22px; font-weight: 650; margin-top: 4px; }
+  .stat .value.warn { color: #fbbf24; }
+  .stat .value.bad { color: #f87171; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; padding: 16px 22px 28px; }
+  .panel { background: #0f1722; border: 1px solid #1c2733; border-radius: 10px; padding: 14px 16px 18px; }
+  .panel h2 { font-size: 13px; margin: 0 0 4px; font-weight: 600; }
+  .panel .sub { font-size: 11px; color: #7d8da0; margin-bottom: 10px; min-height: 14px; }
+  .panel .canvas-wrap { position: relative; height: 200px; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: repeat(2, 1fr); } .stats { grid-template-columns: repeat(3, 1fr); } }
+  @media (max-width: 720px)  { .grid, .stats { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>🛰️ Day 13 — LLM Observability Dashboard</h1>
+  <span class="pill" id="env-pill">env: —</span>
+  <span class="pill live" id="live-pill">⟳ auto-refresh 15s</span>
+  <div class="spacer"></div>
+  <span class="pill" id="updated">last updated: —</span>
+  <span class="pill">source: /metrics &nbsp;·&nbsp; window: 1h</span>
+</header>
+
+<section class="stats">
+  <div class="stat"><div class="label">Traffic (total)</div><div class="value" id="s-traffic">—</div></div>
+  <div class="stat"><div class="label">Latency P95</div><div class="value" id="s-p95">—</div></div>
+  <div class="stat"><div class="label">Error rate</div><div class="value" id="s-err">—</div></div>
+  <div class="stat"><div class="label">Total cost</div><div class="value" id="s-cost">—</div></div>
+  <div class="stat"><div class="label">Quality avg</div><div class="value" id="s-quality">—</div></div>
+</section>
+
+<section class="grid">
+  <div class="panel"><h2>1 · Latency P50 / P95 / P99</h2><div class="sub" id="sub-lat">unit: ms · SLO P95 &lt; 3000ms · alert &gt; 5000ms</div><div class="canvas-wrap"><canvas id="c-lat"></canvas></div></div>
+  <div class="panel"><h2>2 · Traffic (throughput)</h2><div class="sub" id="sub-traffic">unit: requests / 15s interval</div><div class="canvas-wrap"><canvas id="c-traffic"></canvas></div></div>
+  <div class="panel"><h2>3 · Error rate &amp; breakdown</h2><div class="sub" id="sub-err">unit: % · SLO &lt; 2% · alert &gt; 5% · breakdown: none</div><div class="canvas-wrap"><canvas id="c-err"></canvas></div></div>
+  <div class="panel"><h2>4 · Cost over time</h2><div class="sub" id="sub-cost">unit: USD (cumulative) · daily budget $2.50</div><div class="canvas-wrap"><canvas id="c-cost"></canvas></div></div>
+  <div class="panel"><h2>5 · Tokens in / out</h2><div class="sub" id="sub-tok">unit: tokens (cumulative)</div><div class="canvas-wrap"><canvas id="c-tok"></canvas></div></div>
+  <div class="panel"><h2>6 · Quality proxy</h2><div class="sub" id="sub-q">unit: score 0–1 · target ≥ 0.75</div><div class="canvas-wrap"><canvas id="c-q"></canvas></div></div>
+</section>
+
+<script>
+const REFRESH_MS = 15000;
+const MAX_POINTS = 240; // 1 hour at 15s
+const SLO = { latP95: 3000, latAlert: 5000, errSlo: 2, errAlert: 5, quality: 0.75 };
+
+const T = [];                 // x-axis labels (time strings)
+const D = { p50: [], p95: [], p99: [], tput: [], err: [], cost: [], tin: [], tout: [], q: [] };
+let prevTraffic = null;
+
+const css = (v) => getComputedStyle(document.documentElement).getPropertyValue(v);
+const COL = { blue:'#60a5fa', green:'#34d399', amber:'#fbbf24', red:'#f87171', purple:'#c084fc', cyan:'#22d3ee', grey:'#64748b' };
+
+function line(color, label, data, opts = {}) {
+  return Object.assign({ label, data, borderColor: color, backgroundColor: color + '33',
+    borderWidth: 2, pointRadius: 0, tension: 0.25, fill: false }, opts);
+}
+function sloLine(color, label, value) {
+  return { label, data: [], borderColor: color, borderDash: [6,4], borderWidth: 1.5,
+    pointRadius: 0, fill: false, _slo: value };
+}
+const baseOpts = (yTitle, yMin, yMax) => ({
+  responsive: true, maintainAspectRatio: false, animation: false,
+  interaction: { mode: 'index', intersect: false },
+  plugins: { legend: { labels: { boxWidth: 10, font: { size: 10 }, color: '#9fb3c8' } } },
+  scales: {
+    x: { ticks: { maxTicksLimit: 6, color: '#64748b', font: { size: 10 } }, grid: { color: '#16212e' } },
+    y: { title: { display: true, text: yTitle, color: '#7d8da0', font: { size: 10 } },
+         min: yMin, max: yMax, ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: '#16212e' } }
+  }
+});
+
+const charts = {
+  lat: new Chart(document.getElementById('c-lat'), { type: 'line',
+    data: { labels: T, datasets: [ line(COL.blue,'P50',D.p50), line(COL.amber,'P95',D.p95),
+      line(COL.purple,'P99',D.p99), sloLine(COL.grey,'SLO 3000ms',SLO.latP95), sloLine(COL.red,'alert 5000ms',SLO.latAlert) ] },
+    options: baseOpts('ms', 0, null) }),
+  traffic: new Chart(document.getElementById('c-traffic'), { type: 'bar',
+    data: { labels: T, datasets: [ Object.assign(line(COL.cyan,'req / interval',D.tput), { type:'bar', backgroundColor: COL.cyan+'aa', borderWidth:0 }) ] },
+    options: baseOpts('requests', 0, null) }),
+  err: new Chart(document.getElementById('c-err'), { type: 'line',
+    data: { labels: T, datasets: [ line(COL.red,'error rate %',D.err), sloLine(COL.grey,'SLO 2%',SLO.errSlo), sloLine(COL.amber,'alert 5%',SLO.errAlert) ] },
+    options: baseOpts('%', 0, 100) }),
+  cost: new Chart(document.getElementById('c-cost'), { type: 'line',
+    data: { labels: T, datasets: [ line(COL.green,'total cost USD',D.cost, { fill: true }) ] },
+    options: baseOpts('USD', 0, null) }),
+  tok: new Chart(document.getElementById('c-tok'), { type: 'line',
+    data: { labels: T, datasets: [ line(COL.blue,'tokens in',D.tin), line(COL.purple,'tokens out',D.tout) ] },
+    options: baseOpts('tokens', 0, null) }),
+  q: new Chart(document.getElementById('c-q'), { type: 'line',
+    data: { labels: T, datasets: [ line(COL.green,'quality avg',D.q), sloLine(COL.grey,'target 0.75',SLO.quality) ] },
+    options: baseOpts('score', 0, 1) }),
+};
+
+// Stretch SLO dashed lines across the full x-axis on each render.
+function fillSloLines() {
+  for (const ch of Object.values(charts)) {
+    for (const ds of ch.data.datasets) {
+      if (ds._slo !== undefined) ds.data = T.map(() => ds._slo);
+    }
+  }
+}
+
+function push(arr, v) { arr.push(v); if (arr.length > MAX_POINTS) arr.shift(); }
+function setStat(id, text, cls) { const el = document.getElementById(id); el.textContent = text; el.className = 'value' + (cls ? ' ' + cls : ''); }
+
+async function tick() {
+  let m;
+  try {
+    const r = await fetch('/metrics', { cache: 'no-store' });
+    m = await r.json();
+  } catch (e) {
+    document.getElementById('live-pill').textContent = '⚠ /metrics unreachable';
+    document.getElementById('live-pill').classList.remove('live');
+    return;
+  }
+  const now = new Date().toLocaleTimeString();
+
+  // server restarted -> counters reset, clear history
+  if (prevTraffic !== null && m.traffic < prevTraffic) {
+    T.length = 0; for (const k in D) D[k].length = 0; prevTraffic = null;
+  }
+  const tput = prevTraffic === null ? m.traffic : Math.max(0, m.traffic - prevTraffic);
+  prevTraffic = m.traffic;
+
+  const errs = Object.values(m.error_breakdown || {}).reduce((a, b) => a + b, 0);
+  const attempts = m.traffic + errs;
+  const errRate = attempts ? (errs / attempts) * 100 : 0;
+
+  push(T, now);
+  push(D.p50, m.latency_p50); push(D.p95, m.latency_p95); push(D.p99, m.latency_p99);
+  push(D.tput, tput); push(D.err, +errRate.toFixed(2));
+  push(D.cost, m.total_cost_usd); push(D.tin, m.tokens_in_total); push(D.tout, m.tokens_out_total);
+  push(D.q, m.quality_avg);
+
+  fillSloLines();
+  for (const ch of Object.values(charts)) ch.update();
+
+  // header + stat cards
+  document.getElementById('env-pill').textContent = 'env: ' + (m.env || 'dev');
+  document.getElementById('updated').textContent = 'last updated: ' + now;
+  setStat('s-traffic', m.traffic);
+  setStat('s-p95', m.latency_p95 + ' ms', m.latency_p95 > SLO.latAlert ? 'bad' : m.latency_p95 > SLO.latP95 ? 'warn' : '');
+  setStat('s-err', errRate.toFixed(1) + ' %', errRate > SLO.errAlert ? 'bad' : errRate > SLO.errSlo ? 'warn' : '');
+  setStat('s-cost', '$' + m.total_cost_usd);
+  setStat('s-quality', m.quality_avg.toFixed(2), m.quality_avg < SLO.quality ? 'warn' : '');
+
+  const bd = Object.entries(m.error_breakdown || {});
+  document.getElementById('sub-err').textContent =
+    'unit: % · SLO < 2% · alert > 5% · breakdown: ' + (bd.length ? bd.map(([k, v]) => `${k}=${v}`).join(', ') : 'none');
+  document.getElementById('sub-cost').textContent =
+    `unit: USD (cumulative) · avg $${m.avg_cost_usd}/req · daily budget $2.50`;
+}
+
+tick();
+setInterval(tick, REFRESH_MS);
+</script>
+</body>
+</html>

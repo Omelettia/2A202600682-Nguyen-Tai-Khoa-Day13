@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from structlog.contextvars import bind_contextvars
 
 from .agent import LabAgent
@@ -42,11 +43,29 @@ async def metrics() -> dict:
     return snapshot()
 
 
+_DASHBOARD_HTML = Path(__file__).parent / "static" / "dashboard.html"
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard() -> HTMLResponse:
+    """Serve the 6-panel observability dashboard (polls /metrics same-origin)."""
+    return HTMLResponse(_DASHBOARD_HTML.read_text(encoding="utf-8"))
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: Request, body: ChatRequest) -> ChatResponse:
-    # TODO: Enrich logs with request context (user_id_hash, session_id, feature, model, env)
-    # bind_contextvars(...)
-    
+    # Enrich every log emitted for this request with stable, non-PII context.
+    # correlation_id is re-bound from request.state so enrichment holds even if the
+    # middleware's contextvar binding does not propagate into this endpoint's context.
+    bind_contextvars(
+        correlation_id=request.state.correlation_id,
+        user_id_hash=hash_user_id(body.user_id),
+        session_id=body.session_id,
+        feature=body.feature,
+        model=agent.model,
+        env=os.getenv("APP_ENV", "dev"),
+    )
+
     log.info(
         "request_received",
         service="api",
